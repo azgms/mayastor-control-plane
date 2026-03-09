@@ -592,7 +592,7 @@ pub(crate) trait GuardedOperationsHelper:
                 self.delete_spec(registry).await.ok();
                 true
             }
-            SpecStatus::Created(_) | SpecStatus::Deleting => {
+            SpecStatus::Created(_) | SpecStatus::Deleting | SpecStatus::Purging => {
                 // A spec that was being updated is in the `Created` state.
                 // Deleting is also a "temporary" update to the spec.
                 self.handle_incomplete_updates(registry).await
@@ -674,7 +674,7 @@ pub(crate) trait GuardedOperationsHelper:
             if spec.status().deleted() {
                 return Ok(());
             }
-            spec.set_status(SpecStatus::Deleting);
+            spec.set_status(SpecStatus::Purging);
             spec.disown_all();
             spec.start_destroy_op();
             spec.clone()
@@ -767,13 +767,17 @@ pub(crate) trait SpecOperationsHelper:
                 id: self.uuid_str(),
                 kind: self.kind(),
             }),
-            SpecStatus::Deleted | SpecStatus::Deleting if self.allow_op_deleting(&operation) => {
+            SpecStatus::Deleted | SpecStatus::Deleting | SpecStatus::Purging
+                if self.allow_op_deleting(&operation) =>
+            {
                 Ok(())
             }
-            SpecStatus::Deleted | SpecStatus::Deleting => Err(SvcError::PendingDeletion {
-                id: self.uuid_str(),
-                kind: self.kind(),
-            }),
+            SpecStatus::Deleted | SpecStatus::Deleting | SpecStatus::Purging => {
+                Err(SvcError::PendingDeletion {
+                    id: self.uuid_str(),
+                    kind: self.kind(),
+                })
+            }
             SpecStatus::Created(_) => Ok(()),
         }?;
         // start the requested operation (which also checks if it's a valid transition)

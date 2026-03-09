@@ -2,7 +2,10 @@ use crate::controller::{
     reconciler::{GarbageCollect, ReCreate},
     resources::{
         operations::{ResourceLifecycle, ResourceOwnerUpdate},
-        operations_helper::{OperationSequenceGuard, ResourceSpecsLocked, SpecOperationsHelper},
+        operations_helper::{
+            GuardedOperationsHelper, OperationSequenceGuard, ResourceSpecsLocked,
+            SpecOperationsHelper,
+        },
         OperationGuardArc,
     },
     task_poller::{
@@ -146,7 +149,7 @@ async fn destroy_orphaned_replica(
 ) -> PollResult {
     let destroy_owned = {
         let replica = replica.as_ref();
-        replica.managed && !replica.owned() && !replica.status().deleted()
+        replica.managed && !replica.owned() && !replica.status().being_removed()
     };
 
     if destroy_owned {
@@ -163,11 +166,31 @@ async fn destroy_deleting_replica(
     replica: &mut OperationGuardArc<ReplicaSpec>,
     context: &PollContext,
 ) -> PollResult {
-    let deleting = replica.as_ref().status().deleting();
-    if deleting {
+    let status = replica.as_ref().status();
+    if status.deleting() {
         destroy_replica(replica, context).await
+    } else if status.purging() {
+        purge_replica(replica, context).await
     } else {
         PollResult::Ok(PollerState::Idle)
+    }
+}
+
+/// Complete a replica purge (spec-only deletion without contacting io-engine).
+#[tracing::instrument(level = "debug", skip(replica, context), fields(replica.uuid = %replica.uuid(), request.reconcile = true))]
+async fn purge_replica(
+    replica: &mut OperationGuardArc<ReplicaSpec>,
+    context: &PollContext,
+) -> PollResult {
+    match replica.complete_destroy(Ok(()), context.registry()).await {
+        Ok(_) => {
+            tracing::info!(replica.uuid=%replica.uuid(), "Successfully purged replica spec");
+            PollResult::Ok(PollerState::Idle)
+        }
+        Err(error) => {
+            tracing::trace!(replica.uuid=%replica.uuid(), %error, "Failed to purge replica spec");
+            PollResult::Err(error)
+        }
     }
 }
 

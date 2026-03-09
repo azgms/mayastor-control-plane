@@ -24,9 +24,9 @@ use stor_port::{
             snapshots::replica::ReplicaSnapshot,
         },
         transport::{
-            CreatePool, CtrlPoolState, DataLossInfo, DestroyPool, ExpandPool, Pool,
-            PoolDeleteResult, PoolDiag, PoolDiskError, PoolId, PoolStatus, ReplicaOwners,
-            ReplicaTopology, SnapshotId, SnapshotLossDetail, SnapshotLossInfo, VolumeLossDetail,
+            CreatePool, CtrlPoolState, DestroyPool, ExpandPool, Pool, PoolDeleteResult, PoolDiag,
+            PoolDiskError, PoolId, PoolStatus, ReplicaOwners, ReplicaTopology, SnapshotId,
+            SnapshotLossDetail, SnapshotLossInfo, VolumeLossDetail, VolumeLossInfo,
         },
     },
 };
@@ -376,14 +376,14 @@ impl OperationGuardArc<PoolSpec> {
             });
         }
 
-        // 6. Analyze and check data loss using Volume replica topology
-        let data_loss_info = Self::analyze_data_loss(registry, pool_id, &replicas).await?;
-        if let Some(ref info) = data_loss_info {
+        // 6. Analyze and check volume loss using Volume replica topology
+        let volume_loss_info = Self::analyze_volume_loss(registry, pool_id, &replicas).await?;
+        if let Some(ref info) = volume_loss_info {
             if !request.accept_volume_loss {
                 return Err(SvcError::PoolPurgeVolumeLossAcceptRequired {
                     pool_id: pool_id.clone(),
                     volume_count: info.volumes.len(),
-                    data_loss: info.clone(),
+                    volume_loss: info.clone(),
                 });
             }
         }
@@ -439,8 +439,8 @@ impl OperationGuardArc<PoolSpec> {
 
         // 12. Build and return result
         let mut result = PoolDeleteResult::new(pool_id.clone());
-        if let Some(data_loss) = data_loss_info {
-            result.data_loss = data_loss;
+        if let Some(volume_loss) = volume_loss_info {
+            result.volume_loss = volume_loss;
         }
         if let Some(snapshot_loss) = snapshot_loss_info {
             result.snapshot_loss = snapshot_loss;
@@ -450,7 +450,7 @@ impl OperationGuardArc<PoolSpec> {
             pool.id = %pool_id,
             replicas_deleted = replicas.len(),
             snapshots_affected = replica_snapshots.len(),
-            data_loss = result.has_data_loss(),
+            volume_loss = result.has_volume_loss(),
             snapshot_loss = result.has_snapshot_loss(),
             "Pool purged successfully. Affected volumes will be marked faulted by reconciler."
         );
@@ -544,17 +544,17 @@ impl OperationGuardArc<PoolSpec> {
     /// `Volume` object and use its `replica_topology` to determine how many
     /// healthy replicas exist before and after the deletion. A replica is
     /// considered healthy if it is online and marked as fully synced.
-    async fn analyze_data_loss(
+    async fn analyze_volume_loss(
         registry: &Registry,
         pool_id: &PoolId,
         replicas: &[ReplicaSpec],
-    ) -> Result<Option<DataLossInfo>, SvcError> {
+    ) -> Result<Option<VolumeLossInfo>, SvcError> {
         let volume_ids: HashSet<_> = replicas
             .iter()
             .filter_map(|r| r.owners.volume().cloned())
             .collect();
 
-        let mut volumes_with_data_loss = Vec::new();
+        let mut volumes_with_volume_loss = Vec::new();
 
         for volume_id in &volume_ids {
             let volume = match registry.volume(volume_id).await {
@@ -581,7 +581,7 @@ impl OperationGuardArc<PoolSpec> {
             let healthy_after = healthy_before.saturating_sub(healthy_lost);
 
             if healthy_after == 0 && replicas_on_pool > 0 {
-                volumes_with_data_loss.push(VolumeLossDetail {
+                volumes_with_volume_loss.push(VolumeLossDetail {
                     volume_id: volume_id.clone(),
                     replicas_before: total_replicas,
                     healthy_before,
@@ -591,11 +591,11 @@ impl OperationGuardArc<PoolSpec> {
             }
         }
 
-        if volumes_with_data_loss.is_empty() {
+        if volumes_with_volume_loss.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(DataLossInfo {
-                volumes: volumes_with_data_loss,
+            Ok(Some(VolumeLossInfo {
+                volumes: volumes_with_volume_loss,
             }))
         }
     }
