@@ -56,6 +56,7 @@ impl ResourceLifecycle for OperationGuardArc<VolumeSpec> {
     type Create = CreateVolume;
     type CreateOutput = Self;
     type Destroy = DestroyVolume;
+    type DestroyOutput = ();
 
     async fn create(
         registry: &Registry,
@@ -885,7 +886,7 @@ impl ResourceShutdownOperations for OperationGuardArc<VolumeSpec> {
                                 );
                                 // if we're not at least marked for deletion then we'll have to
                                 // get the cluster agent to retry..
-                                if !guard.lock().status().deleting_or_deleted() {
+                                if !guard.lock().status().being_removed() {
                                     result = Err(error);
                                 }
                             }

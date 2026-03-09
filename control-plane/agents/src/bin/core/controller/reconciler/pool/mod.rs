@@ -4,7 +4,9 @@ use crate::controller::{
     reconciler::{GarbageCollect, ReCreate},
     resources::{
         operations::ResourceLifecycle,
-        operations_helper::{OperationSequenceGuard, SpecOperationsHelper},
+        operations_helper::{
+            GuardedOperationsHelper, OperationSequenceGuard, SpecOperationsHelper,
+        },
         OperationGuardArc, TraceSpan,
     },
     task_poller::{PollContext, PollPeriods, PollResult, PollTimer, PollerState, TaskPoller},
@@ -162,8 +164,8 @@ async fn missing_pool_state_reconciler(
                 }
             }
         }
-        .instrument(tracing::info_span!("missing_pool_state_reconciler", pool.id = %pool_spec.id, request.reconcile = true))
-        .await
+            .instrument(tracing::info_span!("missing_pool_state_reconciler", pool.id = %pool_spec.id, request.reconcile = true))
+            .await
     } else {
         PollResult::Ok(PollerState::Idle)
     }
@@ -173,14 +175,22 @@ async fn missing_pool_state_reconciler(
 /// the pool deletion gets struck in Deleting state, this creates a problem as when
 /// the node comes up we cannot create a pool with same specs, the deleting_pool_spec_reconciler
 /// cleans up any such pool when node comes up.
+/// If the pool is in Purging state (from a pool purge operation that failed mid-way),
+/// complete the spec-only deletion without waiting for the node.
 #[tracing::instrument(skip(pool, context), level = "trace", fields(pool.id = %pool.id(), request.reconcile = true))]
 async fn deleting_pool_spec_reconciler(
     pool: &mut OperationGuardArc<PoolSpec>,
     context: &PollContext,
 ) -> PollResult {
-    if !pool.as_ref().status().deleting() {
+    let status = pool.as_ref().status();
+    if !status.deleting() && !status.purging() {
         // nothing to do here
         return PollResult::Ok(PollerState::Idle);
+    }
+
+    // Purging: complete spec-only deletion without waiting for the node.
+    if status.purging() {
+        return purging_pool_spec_reconciler(pool, context).await;
     }
 
     match context.registry().node_wrapper(&pool.as_ref().node).await {
@@ -194,10 +204,7 @@ async fn deleting_pool_spec_reconciler(
 
     let pool_id = &pool.immutable_arc().id;
     async {
-        let request = DestroyPool {
-            node: pool.as_ref().node.clone(),
-            id: pool.as_ref().id.clone(),
-        };
+        let request = DestroyPool::new(pool.as_ref().node.clone(), pool.as_ref().id.clone());
         match pool.destroy(context.registry(), &request).await {
             Ok(_) => {
                 pool.as_ref()
@@ -217,6 +224,58 @@ async fn deleting_pool_spec_reconciler(
         request.reconcile = true
     ))
     .await
+}
+
+/// Complete a pool purge that was interrupted (e.g. by a restart).
+/// Destroys any remaining replica specs on this pool, then completes pool deletion.
+async fn purging_pool_spec_reconciler(
+    pool: &mut OperationGuardArc<PoolSpec>,
+    context: &PollContext,
+) -> PollResult {
+    let pool_id = pool.as_ref().id.clone();
+
+    // Destroy any remaining replica specs on this pool.
+    let replicas: Vec<_> = context
+        .specs()
+        .replicas_cloned()
+        .into_iter()
+        .filter(|r| r.pool_name() == &pool_id)
+        .collect();
+
+    for replica_spec in &replicas {
+        let mut replica = match context.specs().replica(&replica_spec.uuid).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if let Err(error) = replica.start_destroy_for_purge(context.registry()).await {
+            tracing::error!(
+                replica.uuid = %replica_spec.uuid,
+                %error,
+                "Failed to start purge of replica spec during pool purge reconciliation"
+            );
+            return PollResult::Err(error);
+        }
+        if let Err(error) = replica.complete_destroy(Ok(()), context.registry()).await {
+            tracing::error!(
+                replica.uuid = %replica_spec.uuid,
+                %error,
+                "Failed to complete purge of replica spec during pool purge reconciliation"
+            );
+            return PollResult::Err(error);
+        }
+    }
+
+    // Complete pool deletion.
+    match pool.complete_destroy(Ok(()), context.registry()).await {
+        Ok(_) => {
+            tracing::info!(pool.id = %pool_id, "Purged pool spec reconciled successfully");
+            PollResult::Ok(PollerState::Idle)
+        }
+        Err(error) => {
+            tracing::error!(pool.id = %pool_id, %error, "Failed to complete pool purge reconciliation");
+            PollResult::Err(error)
+        }
+    }
 }
 
 #[tracing::instrument(skip(pool, context), level = "trace", fields(pool.id = %pool.id(), request.reconcile = true))]

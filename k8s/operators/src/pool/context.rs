@@ -375,7 +375,7 @@ impl ResourceContext {
                     return Ok(());
                 }
                 // unexpected, let's handle it generically below
-                SpecStatus::Deleting | SpecStatus::Deleted => {}
+                SpecStatus::Deleting | SpecStatus::Deleted | SpecStatus::Purging => {}
             }
         }
 
@@ -514,7 +514,7 @@ impl ResourceContext {
     async fn delete_pool(&self) -> Result<Action, Error> {
         let res = self
             .pools_api()
-            .del_node_pool(&self.spec.node(), &self.name_any())
+            .del_node_pool(&self.spec.node(), &self.name_any(), None)
             .await;
 
         match res {
